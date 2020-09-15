@@ -6,6 +6,7 @@ import os
 import scrypt
 import pyotp
 import qrcode
+
 # Using svg because it doesn't require additional dependencies
 import qrcode.image.svg
 import uuid
@@ -15,9 +16,18 @@ from flask import current_app, url_for
 from itsdangerous import TimedJSONWebSignatureSerializer, BadData
 from jinja2 import Markup
 from passlib.hash import argon2
-from sqlalchemy import ForeignKey
+from sqlalchemy import (
+    Column,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Boolean,
+    DateTime,
+    LargeBinary,
+)
+from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, backref
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, LargeBinary
 from sqlalchemy.orm.exc import MultipleResultsFound, NoResultFound
 
 from db import db
@@ -36,29 +46,56 @@ if typing.TYPE_CHECKING:
     from pyotp import OTP  # noqa: F401
 
 LOGIN_HARDENING = True
-if os.environ.get('SECUREDROP_ENV') == 'test':
+if os.environ.get("SECUREDROP_ENV") == "test":
     LOGIN_HARDENING = False
 
-ARGON2_PARAMS = dict(memory_cost=2**16, rounds=4, parallelism=2)
+ARGON2_PARAMS = dict(memory_cost=2 ** 16, rounds=4, parallelism=2)
+
+metadata = MetaData()
+Base = declarative_base(metadata=metadata)  # type: Any
 
 
-def get_one_or_else(query: 'Query',
-                    logger: 'Logger',
-                    failure_method: 'Callable[[int], None]') -> db.Model:
+def get_one_or_else(
+    query: "Query", logger: "Logger", failure_method: "Callable[[int], None]"
+) -> db.Model:
     try:
         return query.one()
     except MultipleResultsFound as e:
         logger.error(
-            "Found multiple while executing %s when one was expected: %s" %
-            (query, e, ))
+            "Found multiple while executing %s when one was expected: %s" % (query, e)
+        )
         failure_method(500)
     except NoResultFound as e:
         logger.error("Found none when one was expected: %s" % (e,))
         failure_method(404)
 
 
+class SeenFile(db.Model):
+    __tablename__ = "seen_files"
+    file_id = Column(Integer, ForeignKey("submissions.id"), primary_key=True)
+    journalist_id = Column(Integer, ForeignKey("journalists.id"), primary_key=True)
+    file = relationship("Submission", backref="seen_files", cascade="delete")
+    journalist = relationship("Journalist", backref="seen_files")
+
+
+class SeenMessage(db.Model):
+    __tablename__ = "seen_messages"
+    message_id = Column(Integer, ForeignKey("submissions.id"), primary_key=True)
+    journalist_id = Column(Integer, ForeignKey("journalists.id"), primary_key=True)
+    message = relationship("Submission", backref="seen_messages", cascade="delete")
+    journalist = relationship("Journalist", backref="seen_messages")
+
+
+class SeenReply(db.Model):
+    __tablename__ = "seen_replies"
+    reply_id = Column(Integer, ForeignKey("replies.id"), primary_key=True)
+    journalist_id = Column(Integer, ForeignKey("journalists.id"), primary_key=True)
+    reply = relationship("Reply", backref="seen_replies", cascade="delete")
+    journalist = relationship("Journalist", backref="seen_replies")
+
+
 class Source(db.Model):
-    __tablename__ = 'sources'
+    __tablename__ = "sources"
     id = Column(Integer, primary_key=True)
     uuid = Column(String(36), unique=True, nullable=False)
     filesystem_id = Column(String(96), unique=True)
@@ -81,40 +118,48 @@ class Source(db.Model):
     NUM_WORDS = 7
     MAX_CODENAME_LEN = 128
 
-    def __init__(self,
-                 filesystem_id: 'Optional[str]' = None,
-                 journalist_designation: 'Optional[str]' = None) -> None:
+    def __init__(
+        self,
+        filesystem_id: "Optional[str]" = None,
+        journalist_designation: "Optional[str]" = None,
+    ) -> None:
         self.filesystem_id = filesystem_id
         self.journalist_designation = journalist_designation
         self.uuid = str(uuid.uuid4())
 
     def __repr__(self) -> str:
-        return '<Source %r>' % (self.journalist_designation)
+        return "<Source %r>" % (self.journalist_designation)
 
     @property
     def journalist_filename(self) -> str:
-        valid_chars = 'abcdefghijklmnopqrstuvwxyz1234567890-_'
-        return ''.join([c for c in self.journalist_designation.lower().replace(
-            ' ', '_') if c in valid_chars])
+        valid_chars = "abcdefghijklmnopqrstuvwxyz1234567890-_"
+        return "".join(
+            [
+                c
+                for c in self.journalist_designation.lower().replace(" ", "_")
+                if c in valid_chars
+            ]
+        )
 
-    def documents_messages_count(self) -> 'Dict[str, int]':
-        self.docs_msgs_count = {'messages': 0, 'documents': 0}
+    def documents_messages_count(self) -> "Dict[str, int]":
+        self.docs_msgs_count = {"messages": 0, "documents": 0}
         for submission in self.submissions:
-            if submission.filename.endswith('msg.gpg'):
-                self.docs_msgs_count['messages'] += 1
-            elif (submission.filename.endswith('doc.gz.gpg') or
-                  submission.filename.endswith('doc.zip.gpg')):
-                self.docs_msgs_count['documents'] += 1
+            if submission.filename.endswith("msg.gpg"):
+                self.docs_msgs_count["messages"] += 1
+            elif submission.filename.endswith(
+                "doc.gz.gpg"
+            ) or submission.filename.endswith("doc.zip.gpg"):
+                self.docs_msgs_count["documents"] += 1
         return self.docs_msgs_count
 
     @property
-    def collection(self) -> 'List[Union[Submission, Reply]]':
+    def collection(self) -> "List[Union[Submission, Reply]]":
         """Return the list of submissions and replies for this source, sorted
         in ascending order by the filename/interaction count."""
         collection = []  # type: List[Union[Submission, Reply]]
         collection.extend(self.submissions)
         collection.extend(self.replies)
-        collection.sort(key=lambda x: int(x.filename.split('-')[0]))
+        collection.sort(key=lambda x: int(x.filename.split("-")[0]))
         return collection
 
     @property
@@ -141,13 +186,13 @@ class Source(db.Model):
     def public_key(self) -> None:
         raise NotImplementedError
 
-    def to_json(self) -> 'Dict[str, Union[str, bool, int, str]]':
+    def to_json(self) -> "Dict[str, Union[str, bool, int, str]]":
         docs_msg_count = self.documents_messages_count()
 
         if self.last_updated:
-            last_updated = self.last_updated.isoformat() + 'Z'
+            last_updated = self.last_updated.isoformat() + "Z"
         else:
-            last_updated = datetime.datetime.utcnow().isoformat() + 'Z'
+            last_updated = datetime.datetime.utcnow().isoformat() + "Z"
 
         if self.star and self.star.starred:
             starred = True
@@ -155,77 +200,85 @@ class Source(db.Model):
             starred = False
 
         json_source = {
-            'uuid': self.uuid,
-            'url': url_for('api.single_source', source_uuid=self.uuid),
-            'journalist_designation': self.journalist_designation,
-            'is_flagged': self.flagged,
-            'is_starred': starred,
-            'last_updated': last_updated,
-            'interaction_count': self.interaction_count,
-            'key': {
-              'type': 'PGP',
-              'public': self.public_key,
-              'fingerprint': self.fingerprint
+            "uuid": self.uuid,
+            "url": url_for("api.single_source", source_uuid=self.uuid),
+            "journalist_designation": self.journalist_designation,
+            "is_flagged": self.flagged,
+            "is_starred": starred,
+            "last_updated": last_updated,
+            "interaction_count": self.interaction_count,
+            "key": {
+                "type": "PGP",
+                "public": self.public_key,
+                "fingerprint": self.fingerprint,
             },
-            'number_of_documents': docs_msg_count['documents'],
-            'number_of_messages': docs_msg_count['messages'],
-            'submissions_url': url_for('api.all_source_submissions',
-                                       source_uuid=self.uuid),
-            'add_star_url': url_for('api.add_star', source_uuid=self.uuid),
-            'remove_star_url': url_for('api.remove_star',
-                                       source_uuid=self.uuid),
-            'replies_url': url_for('api.all_source_replies',
-                                   source_uuid=self.uuid)
-            }
+            "number_of_documents": docs_msg_count["documents"],
+            "number_of_messages": docs_msg_count["messages"],
+            "submissions_url": url_for(
+                "api.all_source_submissions", source_uuid=self.uuid
+            ),
+            "add_star_url": url_for("api.add_star", source_uuid=self.uuid),
+            "remove_star_url": url_for("api.remove_star", source_uuid=self.uuid),
+            "replies_url": url_for("api.all_source_replies", source_uuid=self.uuid),
+        }
         return json_source
 
 
 class Submission(db.Model):
     MAX_MESSAGE_LEN = 100000
 
-    __tablename__ = 'submissions'
+    __tablename__ = "submissions"
     id = Column(Integer, primary_key=True)
     uuid = Column(String(36), unique=True, nullable=False)
-    source_id = Column(Integer, ForeignKey('sources.id'))
+    source_id = Column(Integer, ForeignKey("sources.id"))
     source = relationship(
-        "Source",
-        backref=backref("submissions", order_by=id, cascade="delete")
-        )
+        "Source", backref=backref("submissions", order_by=id, cascade="delete")
+    )
 
     filename = Column(String(255), nullable=False)
     size = Column(Integer, nullable=False)
     downloaded = Column(Boolean, default=False)
-    '''
+    """
     The checksum of the encrypted file on disk.
     Format: $hash_name:$hex_encoded_hash_value
     Example: sha256:05fa5efd7d1b608ac1fbdf19a61a5a439d05b05225e81faa63fdd188296b614a
-    '''
+    """
     checksum = Column(String(255))
 
     def __init__(self, source: Source, filename: str) -> None:
         self.source_id = source.id
         self.filename = filename
         self.uuid = str(uuid.uuid4())
-        self.size = os.stat(current_app.storage.path(source.filesystem_id,
-                                                     filename)).st_size
+        self.size = os.stat(
+            current_app.storage.path(source.filesystem_id, filename)
+        ).st_size
 
     def __repr__(self) -> str:
-        return '<Submission %r>' % (self.filename)
+        return "<Submission %r>" % (self.filename)
 
-    def to_json(self) -> 'Dict[str, Union[str, int, bool]]':
+    def to_json(self) -> "Dict[str, Union[str, int, bool]]":
         json_submission = {
-            'source_url': url_for('api.single_source',
-                                  source_uuid=self.source.uuid) if self.source else None,
-            'submission_url': url_for('api.single_submission',
-                                      source_uuid=self.source.uuid,
-                                      submission_uuid=self.uuid) if self.source else None,
-            'filename': self.filename,
-            'size': self.size,
-            'is_read': self.downloaded,
-            'uuid': self.uuid,
-            'download_url': url_for('api.download_submission',
-                                    source_uuid=self.source.uuid,
-                                    submission_uuid=self.uuid) if self.source else None,
+            "source_url": url_for("api.single_source", source_uuid=self.source.uuid)
+            if self.source
+            else None,
+            "submission_url": url_for(
+                "api.single_submission",
+                source_uuid=self.source.uuid,
+                submission_uuid=self.uuid,
+            )
+            if self.source
+            else None,
+            "filename": self.filename,
+            "size": self.size,
+            "is_read": self.downloaded,
+            "uuid": self.uuid,
+            "download_url": url_for(
+                "api.download_submission",
+                source_uuid=self.source.uuid,
+                submission_uuid=self.uuid,
+            )
+            if self.source
+            else None,
         }
         return json_submission
 
@@ -235,45 +288,38 @@ class Reply(db.Model):
     id = Column(Integer, primary_key=True)
     uuid = Column(String(36), unique=True, nullable=False)
 
-    journalist_id = Column(Integer, ForeignKey('journalists.id'))
-    journalist = relationship(
-        "Journalist",
-        backref=backref(
-            'replies',
-            order_by=id))
+    journalist_id = Column(Integer, ForeignKey("journalists.id"))
+    journalist = relationship("Journalist", backref=backref("replies", order_by=id))
 
-    source_id = Column(Integer, ForeignKey('sources.id'))
+    source_id = Column(Integer, ForeignKey("sources.id"))
     source = relationship(
-        "Source",
-        backref=backref("replies", order_by=id, cascade="delete")
-        )
+        "Source", backref=backref("replies", order_by=id, cascade="delete")
+    )
 
     filename = Column(String(255), nullable=False)
     size = Column(Integer, nullable=False)
-    '''
+    """
     The checksum of the encrypted file on disk.
     Format: $hash_name:$hex_encoded_hash_value
     Example: sha256:05fa5efd7d1b608ac1fbdf19a61a5a439d05b05225e81faa63fdd188296b614a
-    '''
+    """
     checksum = Column(String(255))
 
     deleted_by_source = Column(Boolean, default=False, nullable=False)
 
-    def __init__(self,
-                 journalist: 'Journalist',
-                 source: Source,
-                 filename: str) -> None:
+    def __init__(self, journalist: "Journalist", source: Source, filename: str) -> None:
         self.journalist_id = journalist.id
         self.source_id = source.id
         self.uuid = str(uuid.uuid4())
         self.filename = filename
-        self.size = os.stat(current_app.storage.path(source.filesystem_id,
-                                                     filename)).st_size
+        self.size = os.stat(
+            current_app.storage.path(source.filesystem_id, filename)
+        ).st_size
 
     def __repr__(self) -> str:
-        return '<Reply %r>' % (self.filename)
+        return "<Reply %r>" % (self.filename)
 
-    def to_json(self) -> 'Dict[str, Union[str, int, bool]]':
+    def to_json(self) -> "Dict[str, Union[str, int, bool]]":
         username = "deleted"
         first_name = ""
         last_name = ""
@@ -284,33 +330,39 @@ class Reply(db.Model):
             last_name = self.journalist.last_name
             uuid = self.journalist.uuid
         json_submission = {
-            'source_url': url_for('api.single_source',
-                                  source_uuid=self.source.uuid) if self.source else None,
-            'reply_url': url_for('api.single_reply',
-                                 source_uuid=self.source.uuid,
-                                 reply_uuid=self.uuid) if self.source else None,
-            'filename': self.filename,
-            'size': self.size,
-            'journalist_username': username,
-            'journalist_first_name': first_name,
-            'journalist_last_name': last_name,
-            'journalist_uuid': uuid,
-            'uuid': self.uuid,
-            'is_deleted_by_source': self.deleted_by_source,
+            "source_url": url_for("api.single_source", source_uuid=self.source.uuid)
+            if self.source
+            else None,
+            "reply_url": url_for(
+                "api.single_reply", source_uuid=self.source.uuid, reply_uuid=self.uuid
+            )
+            if self.source
+            else None,
+            "filename": self.filename,
+            "size": self.size,
+            "journalist_username": username,
+            "journalist_first_name": first_name,
+            "journalist_last_name": last_name,
+            "journalist_uuid": uuid,
+            "uuid": self.uuid,
+            "is_deleted_by_source": self.deleted_by_source,
         }
         return json_submission
 
 
 class SourceStar(db.Model):
-    __tablename__ = 'source_stars'
+    __tablename__ = "source_stars"
     id = Column("id", Integer, primary_key=True)
-    source_id = Column("source_id", Integer, ForeignKey('sources.id'))
+    source_id = Column("source_id", Integer, ForeignKey("sources.id"))
     starred = Column("starred", Boolean, default=True)
 
-    def __eq__(self, other: 'Any') -> bool:
+    def __eq__(self, other: "Any") -> bool:
         if isinstance(other, SourceStar):
-            return (self.source_id == other.source_id and
-                    self.id == other.id and self.starred == other.starred)
+            return (
+                self.source_id == other.source_id
+                and self.id == other.id
+                and self.starred == other.starred
+            )
         return False
 
     def __init__(self, source: Source, starred: bool = True) -> None:
@@ -327,7 +379,7 @@ class FirstOrLastNameError(Exception):
     """Generic error for names that are invalid."""
 
     def __init__(self, msg):
-        msg = 'Invalid first or last name.'
+        msg = "Invalid first or last name."
         super(FirstOrLastNameError, self).__init__(msg)
 
 
@@ -378,7 +430,7 @@ class InvalidPasswordLength(PasswordError):
             return "Password needs to be at least {} characters".format(
                 Journalist.MIN_PASSWORD_LEN
             )
-        return ""   # return empty string that can be appended harmlessly
+        return ""  # return empty string that can be appended harmlessly
 
 
 class NonDicewarePassword(PasswordError):
@@ -407,22 +459,22 @@ class Journalist(db.Model):
     created_on = Column(DateTime, default=datetime.datetime.utcnow)
     last_access = Column(DateTime)
     passphrase_hash = Column(String(256))
-    login_attempts = relationship(
-        "JournalistLoginAttempt",
-        backref="journalist")
+    login_attempts = relationship("JournalistLoginAttempt", backref="journalist")
 
     MIN_USERNAME_LEN = 3
     MIN_NAME_LEN = 0
     MAX_NAME_LEN = 100
-    INVALID_USERNAMES = ['deleted']
+    INVALID_USERNAMES = ["deleted"]
 
-    def __init__(self,
-                 username: str,
-                 password: str,
-                 first_name: 'Optional[str]' = None,
-                 last_name: 'Optional[str]' = None,
-                 is_admin: bool = False,
-                 otp_secret: 'Optional[str]' = None) -> None:
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        first_name: "Optional[str]" = None,
+        last_name: "Optional[str]" = None,
+        is_admin: bool = False,
+        otp_secret: "Optional[str]" = None,
+    ) -> None:
 
         self.check_username_acceptable(username)
         self.username = username
@@ -441,10 +493,10 @@ class Journalist(db.Model):
 
     def __repr__(self) -> str:
         return "<Journalist {0}{1}>".format(
-            self.username,
-            " [admin]" if self.is_admin else "")
+            self.username, " [admin]" if self.is_admin else ""
+        )
 
-    _LEGACY_SCRYPT_PARAMS = dict(N=2**14, r=8, p=1)
+    _LEGACY_SCRYPT_PARAMS = dict(N=2 ** 14, r=8, p=1)
 
     def _scrypt_hash(self, password: str, salt: str) -> str:
         return scrypt.hash(str(password), salt, **self._LEGACY_SCRYPT_PARAMS)
@@ -452,7 +504,7 @@ class Journalist(db.Model):
     MAX_PASSWORD_LEN = 128
     MIN_PASSWORD_LEN = 14
 
-    def set_password(self, passphrase: 'Optional[str]') -> None:
+    def set_password(self, passphrase: "Optional[str]") -> None:
         if passphrase is None:
             raise PasswordError()
 
@@ -460,8 +512,7 @@ class Journalist(db.Model):
 
         # "migrate" from the legacy case
         if not self.passphrase_hash:
-            self.passphrase_hash = \
-                argon2.using(**ARGON2_PARAMS).hash(passphrase)
+            self.passphrase_hash = argon2.using(**ARGON2_PARAMS).hash(passphrase)
             # passlib creates one merged field that embeds randomly generated
             # salt in the output like $alg$salt$hash
             self.pw_hash = None
@@ -473,7 +524,7 @@ class Journalist(db.Model):
 
         self.passphrase_hash = argon2.using(**ARGON2_PARAMS).hash(passphrase)
 
-    def set_name(self, first_name: 'Optional[str]', last_name: 'Optional[str]') -> None:
+    def set_name(self, first_name: "Optional[str]", last_name: "Optional[str]") -> None:
         if first_name:
             self.check_name_acceptable(first_name)
         if last_name:
@@ -485,12 +536,15 @@ class Journalist(db.Model):
     def check_username_acceptable(cls, username: str) -> None:
         if len(username) < cls.MIN_USERNAME_LEN:
             raise InvalidUsernameException(
-                        'Username "{}" must be at least {} characters long.'
-                        .format(username, cls.MIN_USERNAME_LEN))
+                'Username "{}" must be at least {} characters long.'.format(
+                    username, cls.MIN_USERNAME_LEN
+                )
+            )
         if username in cls.INVALID_USERNAMES:
             raise InvalidUsernameException(
-                    "This username is invalid because it is reserved "
-                    "for internal use by the software.")
+                "This username is invalid because it is reserved "
+                "for internal use by the software."
+            )
 
     @classmethod
     def check_name_acceptable(cls, name):
@@ -512,7 +566,7 @@ class Journalist(db.Model):
         if len(password.split()) < 7:
             raise NonDicewarePassword()
 
-    def valid_password(self, passphrase: 'Optional[str]') -> bool:
+    def valid_password(self, passphrase: "Optional[str]") -> bool:
         if not passphrase:
             return False
 
@@ -529,13 +583,12 @@ class Journalist(db.Model):
         else:
             # legacy support
             is_valid = pyotp.utils.compare_digest(
-                self._scrypt_hash(passphrase, self.pw_salt),
-                self.pw_hash)
+                self._scrypt_hash(passphrase, self.pw_salt), self.pw_hash
+            )
 
         # migrate new passwords
         if is_valid and not self.passphrase_hash:
-            self.passphrase_hash = \
-                argon2.using(**ARGON2_PARAMS).hash(passphrase)
+            self.passphrase_hash = argon2.using(**ARGON2_PARAMS).hash(passphrase)
             # passlib creates one merged field that embeds randomly generated
             # salt in the output like $alg$salt$hash
             self.pw_salt = None
@@ -550,43 +603,36 @@ class Journalist(db.Model):
 
     def set_hotp_secret(self, otp_secret: str) -> None:
         self.otp_secret = base64.b32encode(
-            binascii.unhexlify(
-                otp_secret.replace(
-                    " ",
-                    "")))
+            binascii.unhexlify(otp_secret.replace(" ", ""))
+        )
         self.is_totp = False
         self.hotp_counter = 0
 
     @property
-    def totp(self) -> 'OTP':
+    def totp(self) -> "OTP":
         if self.is_totp:
             return pyotp.TOTP(self.otp_secret)
         else:
-            raise ValueError('{} is not using TOTP'.format(self))
+            raise ValueError("{} is not using TOTP".format(self))
 
     @property
-    def hotp(self) -> 'OTP':
+    def hotp(self) -> "OTP":
         if not self.is_totp:
             return pyotp.HOTP(self.otp_secret)
         else:
-            raise ValueError('{} is not using HOTP'.format(self))
+            raise ValueError("{} is not using HOTP".format(self))
 
     @property
     def shared_secret_qrcode(self) -> Markup:
-        uri = self.totp.provisioning_uri(
-            self.username,
-            issuer_name="SecureDrop")
+        uri = self.totp.provisioning_uri(self.username, issuer_name="SecureDrop")
 
-        qr = qrcode.QRCode(
-            box_size=15,
-            image_factory=qrcode.image.svg.SvgPathImage
-        )
+        qr = qrcode.QRCode(box_size=15, image_factory=qrcode.image.svg.SvgPathImage)
         qr.add_data(uri)
         img = qr.make_image()
 
         svg_out = BytesIO()
         img.save(svg_out)
-        return Markup(svg_out.getvalue().decode('utf-8'))
+        return Markup(svg_out.getvalue().decode("utf-8"))
 
     @property
     def formatted_otp_secret(self) -> str:
@@ -594,15 +640,15 @@ class Journalist(db.Model):
         lowercase and split into four groups of four characters. The secret is
         base32-encoded, so it is case insensitive."""
         sec = self.otp_secret
-        chunks = [sec[i:i + 4] for i in range(0, len(sec), 4)]
-        return ' '.join(chunks).lower()
+        chunks = [sec[i : i + 4] for i in range(0, len(sec), 4)]
+        return " ".join(chunks).lower()
 
     def _format_token(self, token: str) -> str:
         """Strips from authentication tokens the whitespace
         that many clients add for readability"""
-        return ''.join(token.split())
+        return "".join(token.split())
 
-    def verify_token(self, token: 'Optional[str]') -> bool:
+    def verify_token(self, token: "Optional[str]") -> bool:
         if not token:
             return False
 
@@ -619,9 +665,7 @@ class Journalist(db.Model):
             # window is 1:30s.
             return self.totp.verify(token, valid_window=1)
         else:
-            for counter_val in range(
-                    self.hotp_counter,
-                    self.hotp_counter + 20):
+            for counter_val in range(self.hotp_counter, self.hotp_counter + 20):
                 if self.hotp.verify(token, counter_val):
                     self.hotp_counter = counter_val + 1
                     db.session.commit()
@@ -632,40 +676,45 @@ class Journalist(db.Model):
     _MAX_LOGIN_ATTEMPTS_PER_PERIOD = 5
 
     @classmethod
-    def throttle_login(cls, user: 'Journalist') -> None:
+    def throttle_login(cls, user: "Journalist") -> None:
         # Record the login attempt...
         login_attempt = JournalistLoginAttempt(user)
         db.session.add(login_attempt)
         db.session.commit()
 
         # ...and reject it if they have exceeded the threshold
-        login_attempt_period = datetime.datetime.utcnow() - \
-            datetime.timedelta(seconds=cls._LOGIN_ATTEMPT_PERIOD)
-        attempts_within_period = JournalistLoginAttempt.query.filter(
-            JournalistLoginAttempt.journalist_id == user.id).filter(
-            JournalistLoginAttempt.timestamp > login_attempt_period).all()
+        login_attempt_period = datetime.datetime.utcnow() - datetime.timedelta(
+            seconds=cls._LOGIN_ATTEMPT_PERIOD
+        )
+        attempts_within_period = (
+            JournalistLoginAttempt.query.filter(
+                JournalistLoginAttempt.journalist_id == user.id
+            )
+            .filter(JournalistLoginAttempt.timestamp > login_attempt_period)
+            .all()
+        )
         if len(attempts_within_period) > cls._MAX_LOGIN_ATTEMPTS_PER_PERIOD:
             raise LoginThrottledException(
                 "throttled ({} attempts in last {} seconds)".format(
-                    len(attempts_within_period),
-                    cls._LOGIN_ATTEMPT_PERIOD))
+                    len(attempts_within_period), cls._LOGIN_ATTEMPT_PERIOD
+                )
+            )
 
     @classmethod
-    def login(cls,
-              username: str,
-              password: 'Optional[str]',
-              token: 'Optional[str]') -> 'Journalist':
+    def login(
+        cls, username: str, password: "Optional[str]", token: "Optional[str]"
+    ) -> "Journalist":
 
         try:
             user = Journalist.query.filter_by(username=username).one()
         except NoResultFound:
-            raise InvalidUsernameException(
-                "invalid username '{}'".format(username))
+            raise InvalidUsernameException("invalid username '{}'".format(username))
 
-        if user.username in Journalist.INVALID_USERNAMES and \
-                user.uuid in Journalist.INVALID_USERNAMES:
-            raise InvalidUsernameException(
-                "Invalid username")
+        if (
+            user.username in Journalist.INVALID_USERNAMES
+            and user.uuid in Journalist.INVALID_USERNAMES
+        ):
+            raise InvalidUsernameException("Invalid username")
 
         if LOGIN_HARDENING:
             cls.throttle_login(user)
@@ -673,8 +722,9 @@ class Journalist(db.Model):
             # Prevent TOTP token reuse
             if user.last_token is not None:
                 if pyotp.utils.compare_digest(token, user.last_token):
-                    raise BadTokenException("previously used two-factor code "
-                                            "{}".format(token))
+                    raise BadTokenException(
+                        "previously used two-factor code " "{}".format(token)
+                    )
         if not user.verify_token(token):
             raise BadTokenException("invalid two-factor code")
         if not user.valid_password(password):
@@ -683,12 +733,13 @@ class Journalist(db.Model):
 
     def generate_api_token(self, expiration: int) -> str:
         s = TimedJSONWebSignatureSerializer(
-            current_app.config['SECRET_KEY'], expires_in=expiration)
-        return s.dumps({'id': self.id}).decode('ascii')  # type:ignore
+            current_app.config["SECRET_KEY"], expires_in=expiration
+        )
+        return s.dumps({"id": self.id}).decode("ascii")  # type:ignore
 
     @staticmethod
     def validate_token_is_not_expired_or_invalid(token):
-        s = TimedJSONWebSignatureSerializer(current_app.config['SECRET_KEY'])
+        s = TimedJSONWebSignatureSerializer(current_app.config["SECRET_KEY"])
         try:
             s.loads(token)
         except BadData:
@@ -697,8 +748,8 @@ class Journalist(db.Model):
         return True
 
     @staticmethod
-    def validate_api_token_and_get_user(token: str) -> 'Union[Journalist, None]':
-        s = TimedJSONWebSignatureSerializer(current_app.config['SECRET_KEY'])
+    def validate_api_token_and_get_user(token: str) -> "Union[Journalist, None]":
+        s = TimedJSONWebSignatureSerializer(current_app.config["SECRET_KEY"])
         try:
             data = s.loads(token)
         except BadData:
@@ -708,16 +759,16 @@ class Journalist(db.Model):
         if revoked_token is not None:
             return None
 
-        return Journalist.query.get(data['id'])
+        return Journalist.query.get(data["id"])
 
-    def to_json(self) -> 'Dict[str, Union[str, bool, str]]':
+    def to_json(self) -> "Dict[str, Union[str, bool, str]]":
         json_user = {
-            'username': self.username,
-            'last_login': self.last_access.isoformat() + 'Z',
-            'is_admin': self.is_admin,
-            'uuid': self.uuid,
-            'first_name': self.first_name,
-            'last_name': self.last_name
+            "username": self.username,
+            "last_login": self.last_access.isoformat() + "Z",
+            "is_admin": self.is_admin,
+            "uuid": self.uuid,
+            "first_name": self.first_name,
+            "last_name": self.last_name,
         }
         return json_user
 
@@ -727,10 +778,11 @@ class JournalistLoginAttempt(db.Model):
     """This model keeps track of journalist's login attempts so we can
     rate limit them in order to prevent attackers from brute forcing
     passwords or two-factor tokens."""
+
     __tablename__ = "journalist_login_attempt"
     id = Column(Integer, primary_key=True)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
-    journalist_id = Column(Integer, ForeignKey('journalists.id'))
+    journalist_id = Column(Integer, ForeignKey("journalists.id"))
 
     def __init__(self, journalist: Journalist) -> None:
         self.journalist_id = journalist.id
@@ -742,19 +794,19 @@ class RevokedToken(db.Model):
     API tokens that have been revoked either through a logout or other revocation mechanism.
     """
 
-    __tablename__ = 'revoked_tokens'
+    __tablename__ = "revoked_tokens"
 
     id = Column(Integer, primary_key=True)
-    journalist_id = Column(Integer, ForeignKey('journalists.id'))
+    journalist_id = Column(Integer, ForeignKey("journalists.id"))
     token = db.Column(db.Text, nullable=False, unique=True)
 
 
 class InstanceConfig(db.Model):
-    '''Versioned key-value store of settings configurable from the journalist
+    """Versioned key-value store of settings configurable from the journalist
     interface.  The current version has valid_until=None.
-    '''
+    """
 
-    __tablename__ = 'instance_config'
+    __tablename__ = "instance_config"
     version = Column(Integer, primary_key=True)
     valid_until = Column(DateTime, default=None, unique=True)
 
@@ -762,15 +814,18 @@ class InstanceConfig(db.Model):
 
     # Columns not listed here will be included by InstanceConfig.copy() when
     # updating the configuration.
-    metadata_cols = ['version', 'valid_until']
+    metadata_cols = ["version", "valid_until"]
 
     def __repr__(self):
-        return "<InstanceConfig(version=%s, valid_until=%s)>" % (self.version, self.valid_until)
+        return "<InstanceConfig(version=%s, valid_until=%s)>" % (
+            self.version,
+            self.valid_until,
+        )
 
     def copy(self):
-        '''Make a copy of only the configuration columns of the given
+        """Make a copy of only the configuration columns of the given
         InstanceConfig object: i.e., excluding metadata_cols.
-        '''
+        """
 
         new = type(self)()
         for col in self.__table__.columns:
@@ -783,14 +838,16 @@ class InstanceConfig(db.Model):
 
     @classmethod
     def get_current(cls):
-        '''If the database was created via db.create_all(), data migrations
+        """If the database was created via db.create_all(), data migrations
         weren't run, and the "instance_config" table is empty.  In this case,
         save and return a base configuration derived from each setting's
         column-level default.
-        '''
+        """
 
         try:
-            return cls.query.filter(cls.valid_until == None).one()  # lgtm [py/test-equals-none]  # noqa: E711, E501
+            return cls.query.filter(
+                cls.valid_until == None
+            ).one()  # lgtm [py/test-equals-none]  # noqa: E711, E501
         except NoResultFound:
             current = cls()
             db.session.add(current)
@@ -799,9 +856,9 @@ class InstanceConfig(db.Model):
 
     @classmethod
     def set(cls, name, value):
-        '''Invalidate the current configuration and append a new one with the
+        """Invalidate the current configuration and append a new one with the
         requested change.
-        '''
+        """
 
         old = cls.get_current()
         old.valid_until = datetime.datetime.utcnow()
